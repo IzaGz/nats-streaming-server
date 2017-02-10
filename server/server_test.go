@@ -8,6 +8,7 @@ import (
 	"os"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -5835,4 +5836,144 @@ func TestMsgsNotSentToSubBeforeSubReqResponse(t *testing.T) {
 		}
 		sub.Unsubscribe()
 	}
+}
+
+func TestFileStoreAcksPool(t *testing.T) {
+	cleanupDatastore(t, defaultDataStore)
+	defer cleanupDatastore(t, defaultDataStore)
+
+	opts := getTestDefaultOptsForFileStore()
+	opts.AckSubsPoolSize = 5
+	s := RunServerWithOpts(opts, nil)
+	defer shutdownRestartedServerOnTestExit(&s)
+
+	sc, nc := createConnectionWithNatsOpts(t, clientName,
+		nats.ReconnectWait(100*time.Millisecond))
+	defer nc.Close()
+	defer sc.Close()
+
+	totalSubs := 10
+	errCh := make(chan error, totalSubs)
+	ch := make(chan bool)
+	count := int32(0)
+	cb := func(m *stan.Msg) {
+		if m.Redelivered {
+			errCh <- fmt.Errorf("Unexpected redelivered message: %v", m)
+		} else if atomic.AddInt32(&count, 1) == int32(totalSubs) {
+			ch <- true
+		}
+	}
+	// Create 10 subs
+	for i := 0; i < totalSubs; i++ {
+		if _, err := sc.Subscribe("foo", cb, stan.AckWait(time.Second)); err != nil {
+			t.Fatalf("Unexpected error on subscribe: %v", err)
+		}
+	}
+	// Send 1 message
+	if err := sc.Publish("foo", []byte("hello")); err != nil {
+		t.Fatalf("Unexpected error on publish: %v", err)
+	}
+	// Wait for all messages to be received
+	if err := Wait(ch); err != nil {
+		t.Fatal("Did not get our messages")
+	}
+	// Wait for more than redelivery time
+	time.Sleep(1500 * time.Millisecond)
+	// Check that there was no error
+	select {
+	case e := <-errCh:
+		t.Fatal(e)
+	default:
+	}
+	// Check that server's subs have ackSub nil
+	subs := s.clients.GetSubs(clientName)
+	if len(subs) != totalSubs {
+		t.Fatalf("Expected %d subs, got %v", totalSubs, len(subs))
+	}
+	for _, sub := range subs {
+		sub.RLock()
+		gotNil := sub.ackSub == nil
+		subID := sub.ID
+		sub.RUnlock()
+		if !gotNil {
+			t.Fatalf("Expected ackSub for sub ID: %v to be nil, was not", subID)
+		}
+	}
+
+	// Stop server and restart with lower pool size
+	s.Shutdown()
+	opts.AckSubsPoolSize = 2
+	s = RunServerWithOpts(opts, nil)
+	// Check that AckInbox with ackSubIndex > AcksPoolSize-1 have
+	// individual ackSub
+	subs = s.clients.GetSubs(clientName)
+	if len(subs) != totalSubs {
+		t.Fatalf("Expected %d subs, got %v", totalSubs, len(subs))
+	}
+	for _, sub := range subs {
+		wantsNil := false
+		sub.RLock()
+		ackSubIndexEnd := strings.Index(sub.AckInbox, ".")
+		if n, _ := strconv.Atoi(sub.AckInbox[:ackSubIndexEnd]); n <= 1 {
+			wantsNil = true
+		}
+		gotNil := sub.ackSub == nil
+		subID := sub.ID
+		sub.RUnlock()
+		if wantsNil && !gotNil {
+			t.Fatalf("Expected ackSub for sub ID: %v to be nil, was not", subID)
+		} else if !wantsNil && gotNil {
+			t.Fatalf("Expected ackSub for sub ID: %v to be not nil, was nil", subID)
+		}
+	}
+
+	// Restart server with no acksSub pool
+	s.Shutdown()
+	opts.AckSubsPoolSize = 0
+	s = RunServerWithOpts(opts, nil)
+	// Check that all subs have an ackSub
+	subs = s.clients.GetSubs(clientName)
+	if len(subs) != totalSubs {
+		t.Fatalf("Expected %d subs, got %v", totalSubs, len(subs))
+	}
+	for _, sub := range subs {
+		sub.RLock()
+		gotNil := sub.ackSub == nil
+		subID := sub.ID
+		sub.RUnlock()
+		if gotNil {
+			t.Fatalf("Expected ackSub for sub ID: %v to be not nil, was nil", subID)
+		}
+	}
+	// Add another subscriber
+	if _, err := sc.Subscribe("foo", func(_ *stan.Msg) {}); err != nil {
+		t.Fatalf("Unexpected error on subscribe: %v", err)
+	}
+	// Restart server
+	s.Shutdown()
+	s = RunServerWithOpts(opts, nil)
+	// Check that the new sub's AckInbox is _INBOX as usual.
+	subs = s.clients.GetSubs(clientName)
+	if len(subs) != totalSubs+1 {
+		t.Fatalf("Expected %d subs, got %v", totalSubs+1, len(subs))
+	}
+	for _, sub := range subs {
+		invalidAckInbox := false
+		sub.RLock()
+		gotNil := sub.ackSub == nil
+		subID := sub.ID
+		if int(subID) > totalSubs {
+			invalidAckInbox = sub.AckInbox[:len(nats.InboxPrefix)] != nats.InboxPrefix
+		}
+		sub.RUnlock()
+		if gotNil {
+			t.Fatalf("Expected ackSub for sub ID: %v to be not nil, was nil", subID)
+		}
+		if invalidAckInbox {
+			t.Fatalf("Unexpected AckInbox: %v", sub)
+		}
+	}
+
+	sc.Close()
+	nc.Close()
 }
